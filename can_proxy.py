@@ -78,11 +78,13 @@ def calculate_checksum(data):
     return checksum & 0xFF
 
 
-async def can_writer_task(can_int1_writer, can_int2_writer, can_ext_writer):
+async def can_writer_task(can_reader, can_writer, TX_queue):
     while True:
-        data = await TX_queue.get()
-        # fuck comms format and ones who came up with it
+        await can_int1_writer.drain()
 
+        data = await TX_queue.get()
+
+        # fuck comms format and ones who came up with it
         try:
             data = data.replace("X", "0")
             can_id = int(data[1:3], 16)
@@ -92,15 +94,10 @@ async def can_writer_task(can_int1_writer, can_int2_writer, can_ext_writer):
 
         frame = create_can_frame(can_id, can_data)
 
-        if can_id <= 128:
-            can_int1_writer.write(bytes(frame))
-            can_int2_writer.write(bytes(frame))
-            await can_int1_writer.drain()
-            await can_int2_writer.drain()
+        can_int1_writer.write(bytes(frame))
 
-#        else:
-#            can_ext_writer.write(bytes(frame))
-#            await can_ext_writer.drain()
+        try:
+           await asyncio.wait_for() 
 
 
 async def can_reader_task(can_reader):
@@ -146,6 +143,7 @@ async def feedback_transmit_task():
             writer.write(message)
         await asyncio.gather(*[writer.drain() for writer in writers])
 
+
 async def start_servers():
     # 1. Uruchom serwery TCP (raz, dzialaja niezaleznie od USB)
     for port in LISTEN_PORTS:
@@ -154,6 +152,9 @@ async def start_servers():
         asyncio.create_task(server.serve_forever())
 
     asyncio.create_task(feedback_transmit_task())
+
+    USB_CAN_INT_SETUP.append(calculate_checksum(setup_frame))
+    USB_CAN_EXT_SETUP.append(calculate_checksum(setup_frame))
 
     # 2. Petla nieskonczona obslugujaca restartowanie USB
     while True:
@@ -168,25 +169,30 @@ async def start_servers():
             r2, w2 = await serial_asyncio.open_serial_connection(url=USB_CAN_INT2_PORT, baudrate=SERIAL_BAUDRATE)
             writers_to_close.append(w2)
 
+            r_ext, w_ext = await serial_asyncio.open_serial_connection(url=USB_CAN_INT2_PORT, baudrate=SERIAL_BAUDRATE)
+            writers_to_close.append(w_ext)
+
             # Konfiguracja (tworzymy kopie listy zeby nie dodawac checksum w nieskonczonosc)
-            setup_frame = USB_CAN_INT_SETUP.copy()
-            setup_frame.append(calculate_checksum(setup_frame))
-            
-            w1.write(bytes(setup_frame))
-            w2.write(bytes(setup_frame))
+            w1.write(bytes(USB_CAN_INT_SETUP))
+            w2.write(bytes(USB_CAN_INT_SETUP))
+            w_ext.write(bytes(USB_CAN_EXT_SETUP))
             await w1.drain()
             await w2.drain()
+            await w_ext.drain()
 
             print("CAN connected. Starting tasks...")
 
             # Uruchomienie taskow komunikacji
-            t1 = asyncio.create_task(can_reader_task(r1))
-            t2 = asyncio.create_task(can_reader_task(r2))
-            # Przekazujemy None jako trzeci argument, bo tak bylo w oryginale
-            t3 = asyncio.create_task(can_writer_task(w1, w2, None))
+            can1_read = asyncio.create_task(can_reader_task(r1))
+            can2_read = asyncio.create_task(can_reader_task(r2))
+            can_ext_read = asyncio.create_task(can_reader_task(r_ext))
+            can_write = asyncio.create_task(can_writer_task(w1, w2, w_ext))
 
             # Czekamy az ktorykolwiek task padnie (np. przez odpiecie kabla)
-            done, pending = await asyncio.wait([t1, t2, t3], return_when=asyncio.FIRST_COMPLETED)
+            done, pending = await asyncio.wait(
+                        [can1_read, can2_read, can_ext_read, can_write], 
+                        return_when=asyncio.FIRST_COMPLETED
+                    )
 
             print("Connection lost! Restarting...")
             for task in pending: task.cancel()
@@ -201,8 +207,8 @@ async def start_servers():
                     w.close()
                     await w.wait_closed()
                 except: pass
-        
-        await asyncio.sleep(5)
+
+    await asyncio.sleep(5)
 
 
 if __name__ == "__main__":
