@@ -4,7 +4,7 @@ import sys
 
 USB_CAN_INT1_PORT = "/dev/ttyUSB0"
 USB_CAN_INT2_PORT = "/dev/ttyUSB1"
-USB_CAN_EXT_PORT = ""
+USB_CAN_EXT_PORT = "/dev/ttyUSB2"
 SERIAL_BAUDRATE = 2000000
 
 MESSAGE_WIDTH = 19
@@ -21,7 +21,7 @@ USB_CAN_INT_SETUP = [
     0xaa,     #  0  Packet header
     0x55,     #  1  Packet header
     0x02,     #  3  Type 
-    0x09,     #  3  CAN Baud Rate (50k) 
+    0x03,     #  3  CAN Baud Rate (500k) 
     0x01,     #  4  Frame Type: Extended Frame  ##   0x01 standard frame,   0x02 extended frame ##
     0x00,     #  5  Filter ID1
     0x00,     #  6  Filter ID2
@@ -78,7 +78,7 @@ def calculate_checksum(data):
     return checksum & 0xFF
 
 
-async def can_writer_task(can_int1_writer, can_int2_writer, can_ext_writer):
+async def can_writer_task(can_int1_writer, can_int2_writer, can_int3_writer):
     while True:
         data = await TX_queue.get()
         # fuck comms format and ones who came up with it
@@ -91,16 +91,19 @@ async def can_writer_task(can_int1_writer, can_int2_writer, can_ext_writer):
             continue
 
         frame = create_can_frame(can_id, can_data)
-
-        if can_id <= 128:
+        if can_int1_writer:
             can_int1_writer.write(bytes(frame))
+        if can_int2_writer:
             can_int2_writer.write(bytes(frame))
-            await can_int1_writer.drain()
-            await can_int2_writer.drain()
+        if can_int3_writer:
+            can_int3_writer.write(bytes(frame))
 
-#        else:
-#            can_ext_writer.write(bytes(frame))
-#            await can_ext_writer.drain()
+        if can_int1_writer:
+            await can_int1_writer.drain()
+        if can_int2_writer:
+            await can_int2_writer.drain()
+        if can_int3_writer:
+            await can_int3_writer.drain()
 
 
 async def can_reader_task(can_reader):
@@ -146,6 +149,7 @@ async def feedback_transmit_task():
             writer.write(message)
         await asyncio.gather(*[writer.drain() for writer in writers])
 
+
 async def start_servers():
     # 1. Uruchom serwery TCP (raz, dzialaja niezaleznie od USB)
     for port in LISTEN_PORTS:
@@ -160,13 +164,16 @@ async def start_servers():
         writers_to_close = []
         try:
             print("Connecting to CAN adapters...")
-            
+
             # Otwarcie polaczen
             r1, w1 = await serial_asyncio.open_serial_connection(url=USB_CAN_INT1_PORT, baudrate=SERIAL_BAUDRATE)
             writers_to_close.append(w1)
-            
+
             r2, w2 = await serial_asyncio.open_serial_connection(url=USB_CAN_INT2_PORT, baudrate=SERIAL_BAUDRATE)
             writers_to_close.append(w2)
+
+            r3, w3 = await serial_asyncio.open_serial_connection(url=USB_CAN_EXT_PORT, baudrate=SERIAL_BAUDRATE)
+            writers_to_close.append(w3)
 
             # Konfiguracja (tworzymy kopie listy zeby nie dodawac checksum w nieskonczonosc)
             setup_frame = USB_CAN_INT_SETUP.copy()
@@ -174,19 +181,22 @@ async def start_servers():
             
             w1.write(bytes(setup_frame))
             w2.write(bytes(setup_frame))
+            w3.write(bytes(setup_frame))
             await w1.drain()
             await w2.drain()
+            await w3.drain()
 
             print("CAN connected. Starting tasks...")
 
             # Uruchomienie taskow komunikacji
             t1 = asyncio.create_task(can_reader_task(r1))
             t2 = asyncio.create_task(can_reader_task(r2))
+            t3 = asyncio.create_task(can_reader_task(r3))
             # Przekazujemy None jako trzeci argument, bo tak bylo w oryginale
-            t3 = asyncio.create_task(can_writer_task(w1, w2, None))
+            t4 = asyncio.create_task(can_writer_task(w1, w2, w3))
 
             # Czekamy az ktorykolwiek task padnie (np. przez odpiecie kabla)
-            done, pending = await asyncio.wait([t1, t2, t3], return_when=asyncio.FIRST_COMPLETED)
+            done, pending = await asyncio.wait([t1, t2, t3, t4], return_when=asyncio.FIRST_COMPLETED)
 
             print("Connection lost! Restarting...")
             for task in pending: task.cancel()
@@ -203,7 +213,6 @@ async def start_servers():
                 except: pass
         
         await asyncio.sleep(5)
-
 
 if __name__ == "__main__":
     try:
